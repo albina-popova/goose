@@ -270,9 +270,24 @@ pub async fn initialize_pricing_cache() -> Result<()> {
     PRICING_CACHE.initialize().await
 }
 
+/// Normalize provider name for pricing lookup
+/// Some providers use the same models as others (e.g., Azure OpenAI uses OpenAI models)
+fn normalize_provider_for_pricing(provider: &str) -> &str {
+    match provider.to_lowercase().as_str() {
+        // Azure OpenAI uses OpenAI models, so use OpenAI pricing
+        "azure_openai" | "azure-openai" | "azureopenai" => "openai",
+        // GitHub Copilot also uses OpenAI/other models
+        "github_copilot" | "github-copilot" | "githubcopilot" => "openai",
+        _ => provider,
+    }
+}
+
 /// Get pricing for a specific model
 pub async fn get_model_pricing(provider: &str, model: &str) -> Option<PricingInfo> {
-    PRICING_CACHE.get_model_pricing(provider, model).await
+    let normalized_provider = normalize_provider_for_pricing(provider);
+    PRICING_CACHE
+        .get_model_pricing(normalized_provider, model)
+        .await
 }
 
 /// Force refresh pricing data
@@ -367,6 +382,25 @@ mod tests {
         assert_eq!(convert_pricing("0.000003"), Some(0.000003));
         assert_eq!(convert_pricing("0.015"), Some(0.015));
         assert_eq!(convert_pricing("invalid"), None);
+    }
+
+    #[test]
+    fn test_normalize_provider_for_pricing() {
+        // Azure OpenAI should map to OpenAI for pricing
+        assert_eq!(normalize_provider_for_pricing("azure_openai"), "openai");
+        assert_eq!(normalize_provider_for_pricing("azure-openai"), "openai");
+        assert_eq!(normalize_provider_for_pricing("azureopenai"), "openai");
+        assert_eq!(normalize_provider_for_pricing("AZURE_OPENAI"), "openai");
+
+        // GitHub Copilot should map to OpenAI for pricing
+        assert_eq!(normalize_provider_for_pricing("github_copilot"), "openai");
+        assert_eq!(normalize_provider_for_pricing("github-copilot"), "openai");
+        assert_eq!(normalize_provider_for_pricing("githubcopilot"), "openai");
+
+        // Other providers should remain unchanged
+        assert_eq!(normalize_provider_for_pricing("openai"), "openai");
+        assert_eq!(normalize_provider_for_pricing("anthropic"), "anthropic");
+        assert_eq!(normalize_provider_for_pricing("google"), "google");
     }
 
     #[tokio::test]
