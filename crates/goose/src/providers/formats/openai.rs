@@ -202,7 +202,21 @@ pub fn format_messages(messages: &[Message], image_format: &ImageFormat) -> Vec<
                 MessageContent::ToolConfirmationRequest(_) => {}
                 MessageContent::ActionRequired(_) => {}
                 MessageContent::Image(image) => {
-                    content_array.push(convert_image(image, image_format));
+                    // Only add images to user messages - many providers don't support images
+                    // in system or assistant messages
+                    if message.role == Role::User {
+                        content_array.push(convert_image(image, image_format));
+                    } else {
+                        tracing::warn!(
+                            "Skipping image in {:?} message - images only supported in user messages",
+                            message.role
+                        );
+                        // Add placeholder text so the model knows there was an image
+                        content_array.push(json!({
+                            "type": "text",
+                            "text": "[Image content removed - not supported in assistant messages]"
+                        }));
+                    }
                 }
                 MessageContent::FrontendToolRequest(request) => match &request.tool_call {
                     Ok(tool_call) => {
