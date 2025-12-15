@@ -121,6 +121,14 @@ export default function DefaultProviderSetupForm({
     );
   };
 
+  const getFieldHint = (parameter: ConfigKey): string | null => {
+    // Azure OpenAI API Key hint
+    if (parameter.name === 'AZURE_OPENAI_API_KEY') {
+      return 'Optional when using Azure credential chain (az login)';
+    }
+    return null;
+  };
+
   if (isLoading) {
     return <div className="text-center py-4">Loading configuration values...</div>;
   }
@@ -135,37 +143,43 @@ export default function DefaultProviderSetupForm({
   }
 
   const renderParametersList = (parameters: ConfigKey[]) => {
-    return parameters.map((parameter) => (
-      <div key={parameter.name}>
-        <label className="block text-sm font-medium text-textStandard mb-1">
-          {getFieldLabel(parameter)}
-          {parameter.required && <span className="text-red-500 ml-1">*</span>}
-        </label>
-        <Input
-          type="text"
-          value={getRenderValue(parameter)}
-          onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
-            setConfigValues((prev) => {
-              const newValue = { ...(prev[parameter.name] || {}), value: e.target.value };
-              return {
-                ...prev,
-                [parameter.name]: newValue,
-              };
-            });
-          }}
-          placeholder={getPlaceholder(parameter)}
-          className={`w-full h-14 px-4 font-regular rounded-lg shadow-none ${
-            validationErrors[parameter.name]
-              ? 'border-2 border-red-500'
-              : 'border border-borderSubtle hover:border-borderStandard'
-          } bg-background-default text-lg placeholder:text-textSubtle font-regular text-textStandard`}
-          required={parameter.required}
-        />
-        {validationErrors[parameter.name] && (
-          <p className="text-red-500 text-sm mt-1">{validationErrors[parameter.name]}</p>
-        )}
-      </div>
-    ));
+    return parameters.map((parameter) => {
+      const hint = getFieldHint(parameter);
+      return (
+        <div key={parameter.name}>
+          <label className="block text-sm font-medium text-textStandard mb-1">
+            {getFieldLabel(parameter)}
+            {parameter.required && <span className="text-red-500 ml-1">*</span>}
+          </label>
+          <Input
+            type="text"
+            value={getRenderValue(parameter)}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+              setConfigValues((prev) => {
+                const newValue = { ...(prev[parameter.name] || {}), value: e.target.value };
+                return {
+                  ...prev,
+                  [parameter.name]: newValue,
+                };
+              });
+            }}
+            placeholder={getPlaceholder(parameter)}
+            className={`w-full h-14 px-4 font-regular rounded-lg shadow-none ${
+              validationErrors[parameter.name]
+                ? 'border-2 border-red-500'
+                : 'border border-borderSubtle hover:border-borderStandard'
+            } bg-background-default text-lg placeholder:text-textSubtle font-regular text-textStandard`}
+            required={parameter.required}
+          />
+          {hint && (
+            <p className="text-textSubtle text-xs mt-1">{hint}</p>
+          )}
+          {validationErrors[parameter.name] && (
+            <p className="text-red-500 text-sm mt-1">{validationErrors[parameter.name]}</p>
+          )}
+        </div>
+      );
+    });
   };
 
   let aboveFoldParameters = parameters.filter((p) => p.required);
@@ -175,6 +189,8 @@ export default function DefaultProviderSetupForm({
     belowFoldParameters = [];
   }
 
+  // Don't use collapsible when there's only 1 optional parameter - show inline instead
+  const useCollapsible = belowFoldParameters.length > 1;
   const expandCtaText = `${optionalExpanded ? 'Hide' : 'Show'} ${belowFoldParameters.length} options `;
 
   return (
@@ -186,7 +202,7 @@ export default function DefaultProviderSetupForm({
       ) : (
         <div>
           <div>{renderParametersList(aboveFoldParameters)}</div>
-          {belowFoldParameters.length > 0 && (
+          {belowFoldParameters.length > 0 && useCollapsible && (
             <Collapsible
               open={optionalExpanded}
               onOpenChange={setOptionalExpanded}
@@ -202,6 +218,9 @@ export default function DefaultProviderSetupForm({
                 {renderParametersList(belowFoldParameters)}
               </CollapsibleContent>
             </Collapsible>
+          )}
+          {belowFoldParameters.length > 0 && !useCollapsible && (
+            <div className="mt-4">{renderParametersList(belowFoldParameters)}</div>
           )}
         </div>
       )}
