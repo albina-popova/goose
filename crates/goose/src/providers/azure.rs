@@ -178,7 +178,7 @@ impl Provider for AzureProvider {
                     false,
                     Some(AZURE_DEFAULT_API_VERSION),
                 ),
-                ConfigKey::new("AZURE_OPENAI_API_KEY", true, true, Some("")),
+                ConfigKey::new("AZURE_OPENAI_API_KEY", false, true, Some("")),
                 ConfigKey::new(
                     "AZURE_OPENAI_USE_V1_API",
                     false,
