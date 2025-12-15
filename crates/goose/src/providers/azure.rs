@@ -20,18 +20,16 @@ pub const AZURE_DOC_URL: &str =
     "https://learn.microsoft.com/en-us/azure/ai-services/openai/concepts/models";
 /// Default API version - updated to support GPT-5 reasoning models
 pub const AZURE_DEFAULT_API_VERSION: &str = "2025-04-01-preview";
-pub const AZURE_OPENAI_KNOWN_MODELS: &[&str] = &[
-    "gpt-4o",
-    "gpt-4o-mini",
-    "gpt-4",
-    "gpt-5",
-    "gpt-5-mini",
-    "gpt-5-nano",
-];
+// For Azure OpenAI, we don't use a static known_models list because
+// the available "models" are actually user-configured deployments.
+// The fetch_supported_models() method returns deployments from ARM API
+// when configured, or falls back to the configured deployment name.
+pub const AZURE_OPENAI_KNOWN_MODELS: &[&str] = &[];
 
 #[derive(Debug)]
 pub struct AzureProvider {
     api_client: ApiClient,
+    endpoint: String,
     deployment_name: String,
     api_version: String,
     model: ModelConfig,
@@ -39,6 +37,9 @@ pub struct AzureProvider {
     /// Use the v1 API format (/openai/v1/chat/completions) instead of the legacy
     /// deployment-based API. Required for GPT-5 reasoning models that use reasoning_effort.
     use_v1_api: bool,
+    // Optional: For dynamic deployment listing via ARM API
+    subscription_id: Option<String>,
+    resource_group: Option<String>,
 }
 
 impl Serialize for AzureProvider {
@@ -99,6 +100,16 @@ impl AzureProvider {
             .get_param("AZURE_OPENAI_API_VERSION")
             .unwrap_or_else(|_| AZURE_DEFAULT_API_VERSION.to_string());
 
+        // Optional ARM API configuration for dynamic deployment listing
+        let subscription_id: Option<String> = config
+            .get_param("AZURE_SUBSCRIPTION_ID")
+            .ok()
+            .filter(|s: &String| !s.is_empty());
+        let resource_group: Option<String> = config
+            .get_param("AZURE_RESOURCE_GROUP")
+            .ok()
+            .filter(|s: &String| !s.is_empty());
+
         // Check if user explicitly requested v1 API, or auto-detect for reasoning models
         let use_v1_api_config: Option<bool> = config
             .get_param::<String>("AZURE_OPENAI_USE_V1_API")
@@ -128,15 +139,19 @@ impl AzureProvider {
         })?;
 
         let auth_provider = AzureAuthProvider { auth };
-        let api_client = ApiClient::new(endpoint, AuthMethod::Custom(Box::new(auth_provider)))?;
+        let api_client =
+            ApiClient::new(endpoint.clone(), AuthMethod::Custom(Box::new(auth_provider)))?;
 
         Ok(Self {
             api_client,
+            endpoint,
             deployment_name,
             api_version,
             model,
             name: Self::metadata().name,
             use_v1_api,
+            subscription_id,
+            resource_group,
         })
     }
 
@@ -157,6 +172,82 @@ impl AzureProvider {
         let response = self.api_client.response_post(&path, payload).await?;
         handle_response_openai_compat(response).await
     }
+
+    /// Fetch deployments from Azure Resource Manager API
+    async fn fetch_deployments_from_arm(
+        &self,
+        subscription_id: &str,
+        resource_group: &str,
+        account_name: &str,
+    ) -> Result<Vec<String>, ProviderError> {
+        // Get ARM token using Azure CLI
+        let output = tokio::process::Command::new("az")
+            .args([
+                "account",
+                "get-access-token",
+                "--resource",
+                "https://management.azure.com",
+            ])
+            .output()
+            .await
+            .map_err(|e| {
+                ProviderError::ExecutionError(format!("Failed to execute Azure CLI: {}", e))
+            })?;
+
+        if !output.status.success() {
+            return Err(ProviderError::ExecutionError(format!(
+                "Azure CLI token request failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        let token_response: Value = serde_json::from_slice(&output.stdout).map_err(|e| {
+            ProviderError::ExecutionError(format!("Invalid token response: {}", e))
+        })?;
+
+        let access_token = token_response["accessToken"]
+            .as_str()
+            .ok_or_else(|| ProviderError::ExecutionError("No accessToken in response".to_string()))?;
+
+        // Call ARM API to list deployments
+        let arm_url = format!(
+            "https://management.azure.com/subscriptions/{}/resourceGroups/{}/providers/Microsoft.CognitiveServices/accounts/{}/deployments?api-version=2023-05-01",
+            subscription_id, resource_group, account_name
+        );
+
+        let client = reqwest::Client::new();
+        let response = client
+            .get(&arm_url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .send()
+            .await
+            .map_err(|e| ProviderError::ExecutionError(format!("ARM API request failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProviderError::ExecutionError(format!(
+                "ARM API returned {}: {}",
+                status, body
+            )));
+        }
+
+        let json: Value = response.json().await.map_err(|e| {
+            ProviderError::ExecutionError(format!("Failed to parse ARM API response: {}", e))
+        })?;
+
+        // Extract deployment names from the response
+        let deployments = json["value"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|deployment| deployment["name"].as_str().map(|s| s.to_string()))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+
+        Ok(deployments)
+    }
 }
 
 #[async_trait]
@@ -174,17 +265,15 @@ impl Provider for AzureProvider {
                 ConfigKey::new("AZURE_OPENAI_DEPLOYMENT_NAME", true, false, None),
                 ConfigKey::new(
                     "AZURE_OPENAI_API_VERSION",
-                    true,
+                    false,
                     false,
                     Some(AZURE_DEFAULT_API_VERSION),
                 ),
-                ConfigKey::new("AZURE_OPENAI_API_KEY", true, true, Some("")),
-                ConfigKey::new(
-                    "AZURE_OPENAI_USE_V1_API",
-                    false,
-                    false,
-                    Some("Auto-detected for GPT-5/o1/o3 models"),
-                ),
+                // API key is optional - Azure credential chain (az login) can be used instead
+                ConfigKey::new("AZURE_OPENAI_API_KEY", false, true, Some("")),
+                // Optional: For dynamic deployment listing via Azure Resource Manager API
+                ConfigKey::new("AZURE_SUBSCRIPTION_ID", false, false, None),
+                ConfigKey::new("AZURE_RESOURCE_GROUP", false, false, None),
             ],
         )
     }
@@ -225,6 +314,49 @@ impl Provider for AzureProvider {
         let mut log = RequestLog::start(model_config, &payload)?;
         log.write(&response, Some(&usage))?;
         Ok((message, ProviderUsage::new(response_model, usage)))
+    }
+
+    async fn fetch_supported_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
+        // For Azure OpenAI, "models" are actually deployments configured in the Azure account
+        // If subscription ID and resource group are configured, query the ARM API
+        if let (Some(subscription_id), Some(resource_group)) =
+            (&self.subscription_id, &self.resource_group)
+        {
+            // Extract account name from endpoint (e.g., "https://myaccount.openai.azure.com/" -> "myaccount")
+            let account_name = self
+                .endpoint
+                .trim_end_matches('/')
+                .replace("https://", "")
+                .replace("http://", "")
+                .split('.')
+                .next()
+                .map(|s| s.to_string());
+
+            if let Some(account) = account_name {
+                match self.fetch_deployments_from_arm(subscription_id, resource_group, &account).await {
+                    Ok(deployments) => {
+                        tracing::debug!(
+                            "Azure OpenAI: found {} deployments via ARM API",
+                            deployments.len()
+                        );
+                        return Ok(Some(deployments));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Azure OpenAI: failed to fetch deployments via ARM API: {}, falling back to configured deployment",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Fall back to returning just the currently configured deployment name
+        tracing::debug!(
+            "Azure OpenAI: returning configured deployment '{}' as available model",
+            self.deployment_name
+        );
+        Ok(Some(vec![self.deployment_name.clone()]))
     }
 }
 
@@ -271,10 +403,8 @@ mod tests {
     }
 
     #[test]
-    fn test_known_models_include_gpt5() {
-        // Ensure GPT-5 models are in the known models list
-        assert!(AZURE_OPENAI_KNOWN_MODELS.contains(&"gpt-5"));
-        assert!(AZURE_OPENAI_KNOWN_MODELS.contains(&"gpt-5-mini"));
-        assert!(AZURE_OPENAI_KNOWN_MODELS.contains(&"gpt-5-nano"));
+    fn test_known_models_is_empty() {
+        // Known models should be empty - we use dynamic discovery via ARM API
+        assert!(AZURE_OPENAI_KNOWN_MODELS.is_empty());
     }
 }
